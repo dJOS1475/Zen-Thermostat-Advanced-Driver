@@ -1,0 +1,18 @@
+{
+  "packageName": "Zen Thermostat Advanced",
+  "author": "Derek Osborn",
+  "version": "2.4.0",
+  "minimumHEVersion": "2.5.0",
+  "dateReleased": "2026-11-21",
+  "releaseNotes": "2.4.0 - Setpoints sent after a mode change confirms, re-send if thermostat overrides a setpoint, exact setpoint matching",
+  "communityLink": "https://community.hubitat.com/t/release-zen-thermostat-advanced-a-reliable-zigbee-driver-for-battery-and-c-wire-zen-thermostats/167611",
+  "drivers": [
+    {
+      "id": "939ca8ca-afae-4a6e-9535-924bf2f32179",
+      "name": "Zen Thermostat Advanced",
+      "namespace": "dJOS",
+      "location": "https://raw.githubusercontent.com/dJOS1475/Zen-Thermostat-Advanced-Driver/main/zen-thermostat-advanced.groovy",
+      "required": true
+    }
+  ]
+}
