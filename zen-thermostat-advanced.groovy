@@ -16,12 +16,34 @@
  *  Device: Zen Within Zen-01 (firmware 1158-0003-00000220), endpoint 01, ZigBee HA 1.2.
  *
  *  Licensed under the Apache License, Version 2.0
+ *
+ *  Changelog:
+ *   2.4.0  Setpoints sent after a mode change confirms; re-send if thermostat overrides a setpoint; exact setpoint matching
+ *   2.3.2  Settings page shows only the options for the chosen modes source
+ *   2.3.1  Discovery finishes reliably; no false "battery alarm cleared" on first reading
+ *   2.3.0  Display units and touchscreen lock restored; C-wire detection uses MainsVoltage only
+ *   2.2.1  Discovery checks Zen manufacturer cluster 0xFE11; LQI/RSSI attributes
+ *   2.2.0  Discovery reads cluster list; Alarms cluster logging; unhandled messages logged
+ *   2.1.1  Discovery progress kept in memory (no duplicate lines)
+ *   2.1.0  Zen battery thresholds and batteryAlarm; C-wire detection; Poll Control limits respected
+ *   2.0.1  Removed programmingMode
+ *   2.0.0  Renamed "Advanced": Zen config code modes, power source, running stage, calibration, attribute discovery
+ *   1.0.9  Quieter check-in refusal logs; lastCheckin updated at most every 15 min
+ *   1.0.8  Cooling setpoint hidden on heat-only units; battery voltage shown to 1 decimal
+ *   1.0.7  Battery type setting with per-type discharge curves and voltage offset
+ *   1.0.6  Revert guard: re-send if the thermostat drops back to the old value
+ *   1.0.5  Thread-safe command queue; write acks matched to the right command
+ *   1.0.4  Log banners for driver updates and settings saves
+ *   1.0.3  Commands confirmed by the thermostat's write-accepted reply
+ *   1.0.2  Battery % calibration; decoded default responses; quieter info logs
+ *   1.0.1  Longer awake window while configuration is pending
+ *   1.0.0  Initial release: Poll Control delivery, verified retries, manual supported modes
  */
 
 import groovy.json.JsonOutput
 import groovy.transform.Field
 
-@Field static final String DRIVER_VERSION = "2.3.2"
+@Field static final String DRIVER_VERSION = "2.4.0"
 
 // Cluster IDs
 @Field static final int CL_BASIC      = 0x0000
@@ -84,6 +106,11 @@ import groovy.transform.Field
 // drop back to the old one a few seconds later; within this window that is treated as a revert and re-sent.
 @Field static final java.util.concurrent.ConcurrentHashMap<String, Map> RECENT = new java.util.concurrent.ConcurrentHashMap<String, Map>()
 @Field static final long REVERT_GUARD_MS = 60000L
+// Within this time after confirming, ANY change away from the requested value is treated as the thermostat
+// overriding it (e.g. the Zen applying its own auto-mode setpoints) and is re-sent. Nobody at the thermostat
+// can produce values like 18.7 °C - its screen only steps in 0.5 °C.
+@Field static final long OVERRIDE_GUARD_MS = 30000L
+@Field static final String MODE_KEY = "0201_001C"
 
 // Attribute discovery progress per device (in memory: concurrent parse() calls would overwrite each other in `state`)
 @Field static final java.util.concurrent.ConcurrentHashMap<String, Set> DISC_OUT = new java.util.concurrent.ConcurrentHashMap<String, Set>()
@@ -571,8 +598,8 @@ void setHeatingSetpoint(temp) {
             extra << newCool
         }
     }
-    enqueue(CL_THERMOSTAT, AT_HEAT_SP, DT_INT16, raw, "heatingSetpoint", 30)
-    if (extra) enqueue(CL_THERMOSTAT, AT_COOL_SP, DT_INT16, extra[0] as int, "coolingSetpoint", 30)
+    enqueue(CL_THERMOSTAT, AT_HEAT_SP, DT_INT16, raw, "heatingSetpoint", spTolerance())
+    if (extra) enqueue(CL_THERMOSTAT, AT_COOL_SP, DT_INT16, extra[0] as int, "coolingSetpoint", spTolerance())
 }
 
 void setCoolingSetpoint(temp) {
@@ -590,8 +617,8 @@ void setCoolingSetpoint(temp) {
         log.warn "${device.displayName}: cooling setpoint is within the ${db / 100}°C deadband of heating - lowering heating setpoint"
         extra << newHeat
     }
-    enqueue(CL_THERMOSTAT, AT_COOL_SP, DT_INT16, raw, "coolingSetpoint", 30)
-    if (extra) enqueue(CL_THERMOSTAT, AT_HEAT_SP, DT_INT16, extra[0] as int, "heatingSetpoint", 30)
+    enqueue(CL_THERMOSTAT, AT_COOL_SP, DT_INT16, raw, "coolingSetpoint", spTolerance())
+    if (extra) enqueue(CL_THERMOSTAT, AT_HEAT_SP, DT_INT16, extra[0] as int, "heatingSetpoint", spTolerance())
 }
 
 void clearPendingCommands() {
@@ -657,18 +684,21 @@ private boolean checkRevert(String key, int raw) {
     if (now() - (r.confirmedAt as long) > REVERT_GUARD_MS) { recent().remove(key); return false }
     int tol = r.tolerance as int
     if (Math.abs((r.value as int) - raw) <= tol) return false          // still holding our value
+    long age = now() - (r.confirmedAt as long)
     boolean reverted = (r.prev != null) ? Math.abs((r.prev as int) - raw) <= tol : true
-    if (!reverted) { recent().remove(key); return false }             // changed to something else (e.g. at the thermostat)
+    boolean overridden = !reverted && age <= OVERRIDE_GUARD_MS
+    if (!reverted && !overridden) { recent().remove(key); return false }   // later change to something else (e.g. at the thermostat)
     recent().remove(key)
 
+    String what = reverted ? "reverted" : "changed"
     int maxAttempts = safeInt(maxRetries, 3) + 1
-    long secs = (now() - (r.confirmedAt as long)).intdiv(1000L)
+    long secs = age.intdiv(1000L)
     if ((r.attempts as int) >= maxAttempts) {
-        reportFailure(r + [key: key], "device reverted it ${secs}s after confirming, no retries left")
+        reportFailure(r + [key: key], "device ${what} it to ${raw} ${secs}s after confirming, no retries left")
         updateQueueStatus()
         return false
     }
-    log.warn "${device.displayName}: device reverted ${r.label} to ${raw} ${secs}s after confirming ${r.value} - re-sending"
+    log.warn "${device.displayName}: device ${what} ${r.label} to ${raw} ${secs}s after confirming ${r.value} - re-sending"
     Map entry = new LinkedHashMap(r)
     entry.remove("confirmedAt")
     Map queue = q()
@@ -701,6 +731,16 @@ private void afterQueueChange() {
     if (q().isEmpty()) {
         unschedule("retryCheck")
         stopFastPoll()
+        return
+    }
+    // Release setpoints that were held for a mode change once it has gone through
+    if (!q().containsKey(MODE_KEY)) {
+        List<String> held
+        synchronized (q()) { held = q().findAll { k, p -> (p.attempts as int) == 0 }.keySet().toList() }
+        if (held) {
+            logDebug "mode change done - sending held ${held.collect { q().get(it)?.label }.join(', ')}"
+            sendPending(held)
+        }
     }
 }
 
@@ -732,9 +772,16 @@ private void sendPending(List<String> keys = null) {
     List<Map> failed = []
     int maxAttempts = safeInt(maxRetries, 3) + 1
     synchronized (queue) {
+        boolean modePending = queue.containsKey(MODE_KEY)
         (keys ?: queue.keySet().toList()).each { String key ->
             Map p = queue.get(key)
             if (p == null) return
+            // Setpoints wait until a pending mode change is confirmed: the Zen applies its own stored
+            // setpoints when it changes mode, which would overwrite setpoints that arrive at the same time.
+            if (modePending && key != MODE_KEY && (p.cluster as int) == CL_THERMOSTAT && (p.attr as int) in [AT_HEAT_SP, AT_COOL_SP]) {
+                logDebug "holding ${p.label}=${p.value} until the mode change is confirmed"
+                return
+            }
             if ((p.attempts as int) >= maxAttempts) {
                 failed << removeEntry(key) + [key: key]
                 return
@@ -1527,6 +1574,9 @@ private Integer currentRaw(int attr) {
     def c = state.confirmed?.get(attrKey(CL_THERMOSTAT, attr))
     return c != null ? c as int : null
 }
+
+/** Setpoint match tolerance in 0.01 °C: just under 0.1 °C for °C hubs, just under 0.5 °F for °F hubs. */
+private int spTolerance() { return scale() == "F" ? 27 : 9 }
 
 private int deadbandRaw() { return (state.limits?.deadband ?: 200) as int }   // default 2.0 °C
 
