@@ -110,7 +110,7 @@ import groovy.transform.Field
 
 metadata {
     definition(name: "Zen Thermostat Advanced", namespace: "dJOS", author: "Derek Osborn",
-               importUrl: "") {
+               importUrl: "https://raw.githubusercontent.com/dJOS1475/Zen-Thermostat-Advanced-Driver/main/zen-thermostat-advanced.groovy") {
         capability "Actuator"
         capability "Sensor"
         capability "Thermostat"
